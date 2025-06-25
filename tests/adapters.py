@@ -591,5 +591,4 @@ def run_train_bpe(
     from tokenizer import TokenizerTrainer
 
     t = TokenizerTrainer(vocab_size, special_tokens).train_on_file(input_path)
-    print(len(t.vocab), len(t.merges))
-    return t.vocab, t.merges
+    return (t.vocab, t.merges)

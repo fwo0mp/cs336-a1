@@ -6,12 +6,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
-from typing import DefaultDict, Dict, Generic, Iterable, List, Optional, Set, Tuple, TypeVar, Union
+from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
 
 import regex as re
 from sortedcontainers import SortedSet
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
+
+_TOKEN_PRESPLIT_SENTINEL: int = 1_000_000 # XXX make this a function of vocab_size instead
 
 @dataclass
 class BPETokenizer:
@@ -50,7 +52,7 @@ class TokenPresplitter(ABC):
         tokens: List[int] = []
 
         TOKEN_REGEX = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        for i, match in enumerate(re.finditer(TOKEN_REGEX, text)):
+        for match in re.finditer(TOKEN_REGEX, text):
             s = match.group(0)
             if not s:
                 continue
@@ -135,15 +137,20 @@ class TokenMerger:
 
         while read_cursor < len(doc):
             if read_cursor < len(doc) - 1 and tuple(doc[read_cursor:read_cursor + 2]) == self.old_pair:
-                self.deltas[tuple(doc[read_cursor:read_cursor + 2])] -= 1
+                self.deltas[(doc[read_cursor], doc[read_cursor + 1])] -= 1
 
                 # decrement counts of pairs that were previously formed on either side
                 # and replace them with newly formed pairs from substituting the new token
                 if read_cursor > 0:
-                    self.deltas[tuple(doc[read_cursor - 1:read_cursor + 1])] -= 1
-                    self.deltas[(doc[read_cursor - 1], self.new_token)] += 1
+                    # when removing the trailing token pair, we need to look behind the write cursor rather than the read cursor,
+                    # because we may have already replaced the previous token with a substitution
+                    assert write_cursor > 0 # must be > 0 because we advance it at least one for each read step
+
+                    self.deltas[(doc[write_cursor - 1], doc[read_cursor])] -= 1
+                    self.deltas[(doc[write_cursor - 1], self.new_token)] += 1
+
                 if read_cursor < len(doc) - 2:
-                    self.deltas[tuple(doc[read_cursor + 1:read_cursor + 3])] -= 1
+                    self.deltas[(doc[read_cursor + 1], doc[read_cursor + 2])] -= 1
                     self.deltas[(self.new_token, doc[read_cursor + 2])] += 1
 
                 doc[write_cursor] = self.new_token
@@ -191,11 +198,12 @@ class TokenizerTrainer:
 
     def train_on_file(self, path: os.PathLike, n_workers: Optional[int] = None):
         n_workers = n_workers or os.cpu_count()
+        assert n_workers is not None
 
         with open(path, "rb") as input_file:
             chunk_boundaries = find_chunk_boundaries(input_file, n_workers, b"<|endoftext|>")
 
-        chunks: List[Tuple[int, int]] = zip(chunk_boundaries[:-1], chunk_boundaries[1:])
+        chunks: Iterable[Tuple[int, int]] = zip(chunk_boundaries[:-1], chunk_boundaries[1:])
         
         pool = Pool(n_workers)
         token_presplits = pool.map(presplit_docs, [FileChunkPresplitter(self.special_tokens, path, *chunk) for chunk in chunks])
@@ -204,6 +212,8 @@ class TokenizerTrainer:
 
     def train_on_strings(self, docs: List[str], n_workers: Optional[int] = None):
         n_workers = n_workers or os.cpu_count()
+        assert n_workers is not None
+
         pool = Pool(n_workers)
         token_presplits = pool.map(presplit_docs, [StringDocPresplitter(self.special_tokens, chunk) for chunk in _chunkify(docs, 100)])
 
@@ -222,29 +232,29 @@ class TokenizerTrainer:
 
         merges: List[Tuple[bytes, bytes]] = []
         doc_tokens: List[List[int]] = []
+        byte_pair_counts: DefaultDict[Tuple[int, int], int] = defaultdict(int)
+
+        # per spec, sort lexicographically on token contents in case of count ties
+        def pair_sort_key(x: Tuple[int, Tuple[int, int]]) -> Tuple[int, bytes, bytes]:
+            return (x[0], vocab[x[1][0]], vocab[x[1][1]])
+
+        top_counts: SortedSet[Tuple[int, Tuple[int, int]]] = SortedSet(key=pair_sort_key) # type: ignore
 
         for token_split in token_presplits:
             for doc in token_split.tokens:
                 single_doc_tokens: List[int] = []
                 for batch_token_id in doc:
                     token_value: bytes = token_split.id_to_token[batch_token_id]
+                    single_doc_tokens.extend(list(token_value))
+                    single_doc_tokens.append(_TOKEN_PRESPLIT_SENTINEL)
 
-                    if token_value not in token_lookup:
-                        _add_token(token_value)
-
-                    global_token_id: int = token_lookup[token_value]
-                    single_doc_tokens.append(global_token_id)
+                    # XXX could also track counts in pre-split to make this faster
+                    for i in range(len(token_value) - 1):
+                        byte_pair_counts[tuple(token_value[i:i+2])] += 1
 
                 doc_tokens.append(single_doc_tokens)
 
-        byte_pair_counts: DefaultDict[Tuple[int, int], int] = defaultdict(int)
-        top_counts: SortedSet[Tuple[int, Tuple[int, int]]] = SortedSet()
-
-        # initialize all pairs (don't cross doc boundaries)
-        for doc in doc_tokens:
-            for i in range(len(doc) - 1):
-                byte_pair_counts[tuple(doc[i:i+2])] += 1
-
+        # initialize byte pair ordering
         for pair, top_count in byte_pair_counts.items():
             top_counts.add((top_count, pair))
 
@@ -256,13 +266,12 @@ class TokenizerTrainer:
             top_count, top_pair = next(reversed(top_counts))
             t1, t2 = top_pair
 
-            print(f"removing {top_count} instances of pair {top_pair}")
-
             # register new token
             merges.append((vocab[t1], vocab[t2]))
             new_token: bytes = vocab[t1] + vocab[t2]
             _add_token(new_token)
 
+            # print(f"replacing {top_count} instances of pair {top_pair}: {(vocab[t1], vocab[t2])} with new token {new_token} ({len(vocab) - 1})")
             # print(f"created new token {new_token} with id {token_lookup[new_token]}")
 
             # merge token pair in each document and update pair counts accordingly
@@ -271,8 +280,11 @@ class TokenizerTrainer:
             merge_results = [merge_tokens(docs, top_pair, token_lookup[new_token]) for docs in _chunkify(doc_tokens, 10)]
             for pair_deltas in merge_results:
                 for changed_pair, delta in pair_deltas.items():
-                    #print(f"changing count of {changed_pair} by {delta}")
-                    if changed_pair in byte_pair_counts:
+                    if _TOKEN_PRESPLIT_SENTINEL in changed_pair:
+                        continue
+
+                    #print(f"changing count of {changed_pair} by {delta}: {byte_pair_counts.get(changed_pair,0)} + {delta}")
+                    if byte_pair_counts.get(changed_pair, 0):
                         top_counts.remove((byte_pair_counts[changed_pair], changed_pair))
                     byte_pair_counts[changed_pair] += delta
                     if byte_pair_counts[changed_pair] > 0:
@@ -281,14 +293,15 @@ class TokenizerTrainer:
             # we should have removed all entries naturally as part of processing above
             for count, pair in top_counts:
                 if pair == top_pair:
+                    for doc in doc_tokens:
+                        print("\n".join(str(vocab[token] if token != _TOKEN_PRESPLIT_SENTINEL else "") for token in doc))
                     print(f"still {count} pairs remaining of processed pair {top_pair}")
                     assert False
 
-        print(f"done merging with vocab size of {len(vocab)}")
         for special_token in self.special_tokens:
-            _add_token(special_token)
+            _add_token(bytes(special_token, encoding="utf-8"))
 
-        return BPETokenizer(vocab=vocab, merges=merges)
+        return BPETokenizer(vocab=dict(enumerate(vocab)), merges=merges)
 
 
 if __name__ == "__main__":
