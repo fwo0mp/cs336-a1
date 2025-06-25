@@ -13,8 +13,6 @@ from sortedcontainers import SortedSet
 
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
-_TOKEN_PRESPLIT_SENTINEL: int = 1_000_000 # XXX make this a function of vocab_size instead
-
 @dataclass
 class BPETokenizer:
     vocab: Dict[int, bytes]
@@ -194,6 +192,7 @@ class TokenizerTrainer:
     def __init__(self, vocab_size: int, special_tokens: Iterable[str]):
         self.vocab_size: int = vocab_size
         self.special_tokens: Set[str] = set(special_tokens)
+        self._presplit_sentinel: int = self.vocab_size + 1
 
 
     def train_on_file(self, path: os.PathLike, n_workers: Optional[int] = None):
@@ -246,7 +245,7 @@ class TokenizerTrainer:
                 for batch_token_id in doc:
                     token_value: bytes = token_split.id_to_token[batch_token_id]
                     single_doc_tokens.extend(list(token_value))
-                    single_doc_tokens.append(_TOKEN_PRESPLIT_SENTINEL)
+                    single_doc_tokens.append(self._presplit_sentinel)
 
                     # XXX could also track counts in pre-split to make this faster
                     for i in range(len(token_value) - 1):
@@ -280,7 +279,7 @@ class TokenizerTrainer:
             merge_results = [merge_tokens(docs, top_pair, token_lookup[new_token]) for docs in _chunkify(doc_tokens, 10)]
             for pair_deltas in merge_results:
                 for changed_pair, delta in pair_deltas.items():
-                    if _TOKEN_PRESPLIT_SENTINEL in changed_pair:
+                    if self._presplit_sentinel in changed_pair:
                         continue
 
                     #print(f"changing count of {changed_pair} by {delta}: {byte_pair_counts.get(changed_pair,0)} + {delta}")
@@ -294,7 +293,7 @@ class TokenizerTrainer:
             for count, pair in top_counts:
                 if pair == top_pair:
                     for doc in doc_tokens:
-                        print("\n".join(str(vocab[token] if token != _TOKEN_PRESPLIT_SENTINEL else "") for token in doc))
+                        print("\n".join(str(vocab[token] if token != self._presplit_sentinel else "") for token in doc))
                     print(f"still {count} pairs remaining of processed pair {top_pair}")
                     assert False
 
