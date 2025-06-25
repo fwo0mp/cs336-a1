@@ -189,10 +189,11 @@ def _chunkify(l: List[T], chunk_size: int) -> List[List[T]]:
 
 
 class TokenizerTrainer:
-    def __init__(self, vocab_size: int, special_tokens: Iterable[str]):
+    def __init__(self, vocab_size: int, special_tokens: Iterable[str], debug: bool = False):
         self.vocab_size: int = vocab_size
         self.special_tokens: Set[str] = set(special_tokens)
         self._presplit_sentinel: int = self.vocab_size + 1
+        self._debug = debug
 
 
     def train_on_file(self, path: os.PathLike, n_workers: Optional[int] = None):
@@ -286,16 +287,40 @@ class TokenizerTrainer:
                     if byte_pair_counts.get(changed_pair, 0):
                         top_counts.remove((byte_pair_counts[changed_pair], changed_pair))
                     byte_pair_counts[changed_pair] += delta
-                    if byte_pair_counts[changed_pair] > 0:
-                        top_counts.add((byte_pair_counts[changed_pair], changed_pair))
 
-            # we should have removed all entries naturally as part of processing above
-            for count, pair in top_counts:
-                if pair == top_pair:
-                    for doc in doc_tokens:
-                        print("\n".join(str(vocab[token] if token != self._presplit_sentinel else "") for token in doc))
-                    print(f"still {count} pairs remaining of processed pair {top_pair}")
-                    assert False
+                    if byte_pair_counts[changed_pair] == 0:
+                        del byte_pair_counts[changed_pair]
+                    elif byte_pair_counts[changed_pair] > 0:
+                        top_counts.add((byte_pair_counts[changed_pair], changed_pair))
+                    else:
+                        print(f"pair {changed_pair} would end up with negative count of {byte_pair_counts[changed_pair]}")
+                        assert False
+
+            if self._debug:
+                # explicitly verify all intended invariants in debug mode
+
+                # we should have removed all entries naturally as part of processing above
+                for count, pair in top_counts:
+                    if pair == top_pair:
+                        for doc in doc_tokens:
+                            print("\n".join(str(vocab[token] if token != self._presplit_sentinel else "") for token in doc))
+                        print(f"still {count} pairs remaining of processed pair {top_pair}")
+                        assert False
+
+                # count caches should always be in sync
+                assert len(byte_pair_counts) == len(top_counts)
+                for pair, count in byte_pair_counts.items():
+                    if (count, pair) not in top_counts:
+                        print(f"{pair=} with {count=} missing from top counts")
+                        assert False
+
+                # reconstruct pair counts from scratch to make sure the cached values are accurate
+                manual_pair_counts: DefaultDict[Tuple[int, int], int] = defaultdict(int)
+                for doc in doc_tokens:
+                    for token_pair in zip(doc[:-1], doc[1:]):
+                        if self._presplit_sentinel not in token_pair:
+                            manual_pair_counts[token_pair] += 1
+                assert sorted(list(manual_pair_counts.items())) == sorted(list(byte_pair_counts.items()))
 
         for special_token in self.special_tokens:
             _add_token(bytes(special_token, encoding="utf-8"))
