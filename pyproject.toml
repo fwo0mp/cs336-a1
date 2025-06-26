@@ -18,6 +18,14 @@ dependencies = [
     "torch~=2.2.2; sys_platform == 'darwin' and platform_machine == 'x86_64'", # Intel Macs
     "tqdm>=4.67.1",
     "wandb>=0.19.7",
+    "huggingface>=0.0.1",
+    "huggingface-hub>=0.33.0",
+    "ipython>=9.3.0",
+    "ipykernel>=6.29.5",
+    "jupyter>=1.1.1",
+    "datasets>=3.6.0",
+    "sortedcontainers>=2.4.0",
+    "scalene>=1.5.51",
 ]
 
 
