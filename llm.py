@@ -61,3 +61,30 @@ class RMSNorm(torch.nn.Module):
         )
 
         return weighted.to(original_dtype)
+
+
+class SwiGLU(torch.nn.Module):
+    def __init__(self, d_model: int, d_ff: Optional[int] = None, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff or (math.ceil(self.d_model / 64.) * 64)
+
+        self.w1 = torch.nn.Parameter(torch.randn(self.d_ff, self.d_model))
+        self.w2 = torch.nn.Parameter(torch.randn(self.d_model, self.d_ff))
+        self.w3 = torch.nn.Parameter(torch.randn(self.d_ff, self.d_model))
+
+        self.einsum = False
+
+    def forward(self, x: Float[torch.Tensor, "... d_model"]) -> Float[torch.Tensor, "... d_model"]:
+        if self.einsum:
+            p1: Float[torch.Tensor, "... d_ff"] = einsum(x, self.w1, "... d_model, d_ff d_model-> ... d_ff")
+            p1 = einsum(p1, torch.sigmoid(p1), "... d_ff, ... d_ff -> ... d_ff")
+            p3: Float[torch.Tensor, "... d_ff"] = einsum(x, self.w3, "... d_model, d_ff d_model -> ... d_ff")
+            inner_product: Float[torch.Tensor, "... d_ff"] = einsum(p1, p3, "... d_ff, ... d_ff -> ... d_ff")
+            return einsum(inner_product, self.w2, "... d_ff, d_model d_ff -> ... d_model")
+        else:
+            p1 = x @ self.w1.T
+            p1 *= torch.sigmoid(p1)
+            p3 = x @ self.w3.T
+            inner_product = p1 * p3
+            return inner_product @ self.w2.T
