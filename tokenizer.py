@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from multiprocessing import Pool
 from multiprocessing.pool import ThreadPool
-from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple, TypeVar
+from typing import DefaultDict, Dict, Iterable, Iterator, List, Optional, Set, Tuple, TypeVar, Union
 
 import regex as re
 from sortedcontainers import SortedSet
@@ -14,7 +14,7 @@ from sortedcontainers import SortedSet
 from cs336_basics.pretokenization_example import find_chunk_boundaries
 
 @dataclass
-class BPETokenizer:
+class BPEParams:
     vocab: Dict[int, bytes]
     merges: List[Tuple[bytes, bytes]]
 
@@ -27,7 +27,6 @@ class TokenSplit:
 
 def split_text_into_docs(all_docs: str, special_tokens: Set[str]) -> List[str]:
     special_token_regex = re.compile("|".join(special_tokens))
-    # XXX this splits on all special tokens; do we want to separate docs only on eod?
     return re.split(special_token_regex, all_docs)
 
 
@@ -42,9 +41,6 @@ class TokenPresplitter(ABC):
         """
             each class instance builds its own indepdendent token id mapping to allow for pure parallelization without
             sharing data across threads.  they will be merged back together after each thread finishes
-
-            XXX: given that token mappings should be extremely read-heavy, is it actually faster to just use a shared
-            mapping and eat the cross-thread contention overhead?
         """
 
         tokens: List[int] = []
@@ -80,7 +76,7 @@ class TokenPresplitter(ABC):
 
 
 class FileChunkPresplitter(TokenPresplitter):
-    def __init__(self, special_tokens: Set[str], data_path: os.PathLike, start_index: int, end_index: int):
+    def __init__(self, special_tokens: Set[str], data_path: Union[str, os.PathLike], start_index: int, end_index: int):
         super().__init__(special_tokens)
         self.data_path = data_path
         self.start_index = start_index
@@ -94,8 +90,6 @@ class FileChunkPresplitter(TokenPresplitter):
         
         for doc in split_text_into_docs(input_data, self.special_tokens):
             yield doc
-
-        # return [input_data]
 
 
 class StringDocPresplitter(TokenPresplitter):
@@ -196,7 +190,7 @@ class TokenizerTrainer:
         self._debug = debug
 
 
-    def train_on_file(self, path: os.PathLike, n_workers: Optional[int] = None):
+    def train_on_file(self, path: Union[str, os.PathLike], n_workers: Optional[int] = None):
         n_workers = n_workers or os.cpu_count()
         assert n_workers is not None
 
@@ -219,7 +213,7 @@ class TokenizerTrainer:
 
         return self._merge_presplits(token_presplits, n_workers)
 
-    def _merge_presplits(self, token_presplits: List[TokenSplit], n_workers: int) -> BPETokenizer:
+    def _merge_presplits(self, token_presplits: List[TokenSplit], n_workers: int) -> BPEParams:
         thread_pool = ThreadPool(n_workers)
         
         vocab: List[bytes] = [bytes([b]) for b in range(256)]
@@ -250,7 +244,7 @@ class TokenizerTrainer:
 
                     # XXX could also track counts in pre-split to make this faster
                     for i in range(len(token_value) - 1):
-                        byte_pair_counts[tuple(token_value[i:i+2])] += 1
+                        byte_pair_counts[(token_value[i], token_value[i+1])] += 1
 
                 doc_tokens.append(single_doc_tokens)
 
@@ -276,8 +270,8 @@ class TokenizerTrainer:
 
             # merge token pair in each document and update pair counts accordingly
             # note: this modifies `doc` in place for efficiency
-            #merge_results = thread_pool.map(lambda docs: merge_tokens(docs, top_pair, token_lookup[new_token]), _chunkify(doc_tokens, 10))
-            merge_results = [merge_tokens(docs, top_pair, token_lookup[new_token]) for docs in _chunkify(doc_tokens, 10)]
+            merge_results = thread_pool.map(lambda docs: merge_tokens(docs, top_pair, token_lookup[new_token]), _chunkify(doc_tokens, 10))
+            #merge_results = [merge_tokens(docs, top_pair, token_lookup[new_token]) for docs in _chunkify(doc_tokens, 10)]
             for pair_deltas in merge_results:
                 for changed_pair, delta in pair_deltas.items():
                     if self._presplit_sentinel in changed_pair:
@@ -325,7 +319,123 @@ class TokenizerTrainer:
         for special_token in self.special_tokens:
             _add_token(bytes(special_token, encoding="utf-8"))
 
-        return BPETokenizer(vocab=dict(enumerate(vocab)), merges=merges)
+        return BPEParams(vocab=dict(enumerate(vocab)), merges=merges)
+
+
+class Trie:
+    def __init__(self):
+        self.children: Dict[int, Trie] = {}
+
+
+class BPETokenizer:
+    def __init__(self, params: BPEParams, special_tokens: Iterable[str] = []):
+        self.vocab = params.vocab
+        self.vocab_lookup: Dict[bytes, int] = {v : k for k, v in self.vocab.items()}
+        self.merges = params.merges
+        self.special_tokens: Set[str] = set(special_tokens)
+
+        assert list(sorted(self.vocab_lookup.values())) == list(range(len(self.vocab_lookup)))
+
+        for token in self.special_tokens:
+            token_bytes = bytes(token, encoding="utf-8")
+            if token_bytes not in self.vocab_lookup:
+                next_token: int = len(self.vocab)
+                self.vocab_lookup[token_bytes] = next_token
+                self.vocab[next_token] = token_bytes
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[List[str]] = None):
+        raise NotImplementedError
+
+
+    def _str_to_bytes(self, text: str) -> List[bytes]:
+        """
+            converts string to raw bytes, first stripping out special tokens and converting those
+        """
+        def convert_raw_bytes(s: str) -> List[bytes]:
+            return [bytes([b]) for b in bytes(s, encoding="utf-8")]
+
+        if len(self.special_tokens) == 0:
+            return convert_raw_bytes(text)
+
+        special_token_spans: List[Tuple[int, int]] = []
+
+        for special_token in self.special_tokens:
+            special_token_spans.extend(match.span() for match in re.finditer(re.escape(special_token), text))
+
+        # sort by start and then *reverse* end so that we greedily consume the biggest tokens
+        # in the case of overlaps
+        special_token_spans.sort(key=lambda span: (span[0], -span[1]))
+
+        read_cursor: int = 0
+        buffer: List[bytes] = []
+        for start, end in special_token_spans:
+            # skip special tokens that were already consumed as subset of previous
+            if start < read_cursor:
+                continue
+
+            # add any raw bytes we've passed since the previous special token
+            if start > read_cursor:
+                buffer.extend(convert_raw_bytes(text[read_cursor:start]))
+
+            # slice out the special token itself and add it to the output as a single token
+            special_token_bytes: bytes = bytes(text[start:end], encoding="utf-8")
+            assert special_token_bytes in self.vocab_lookup, f"unknown special token {text[start:end]}"
+            buffer.append(special_token_bytes)
+
+            read_cursor = end
+
+        # add any remaining text after the final special token
+        if read_cursor < len(text):
+            buffer.extend(convert_raw_bytes(text[read_cursor:]))
+
+        return buffer
+
+
+    def encode(self, text: str) -> List[int]:
+        # WARNING: assumes that each byte is its own token id
+        tokens: List[int] = list(bytes(text, encoding="utf-8"))
+
+        # XXX very naive approach; build trie upon construction to make this faster?
+        # not guaranteed to be "the correct" encoding, but will round-trip correctly
+
+        buffer: List[bytes] = self._str_to_bytes(text)
+        for t1, t2 in self.merges:
+            new_token = t1 + t2
+            assert new_token in self.vocab_lookup
+            
+            read_cursor: int = 0
+            write_cursor: int = 0
+
+            while read_cursor < len(buffer):
+                if read_cursor < len(buffer) - 1 and tuple(buffer[read_cursor:read_cursor + 2]) == (t1, t2):
+                    buffer[write_cursor] = new_token
+                    read_cursor += 2
+                else:
+                    buffer[write_cursor] = buffer[read_cursor]
+                    read_cursor += 1
+
+                write_cursor += 1
+
+            buffer[write_cursor:] = []
+
+        return [self.vocab_lookup[b] for b in buffer]
+
+
+    def encode_iterable(self, texts: Iterable[str]) -> Iterator[int]:
+        # XXX do we need to get more sophisticated than this, or is it safe to assume that
+        # every individual string is small enough to safely process in full?
+        for text in texts:
+            for token in self.encode(text):
+                yield token
+
+
+    def decode(self, ids: List[int]) -> str:
+        # XXX probably a more efficient way to do this
+        all_bytes: bytes = bytes()
+        for token in ids:
+            all_bytes += self.vocab[token]
+        return all_bytes.decode(encoding="utf-8", errors="ignore")
 
 
 if __name__ == "__main__":
