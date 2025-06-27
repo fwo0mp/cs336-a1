@@ -165,13 +165,13 @@ def attention(
     assert keys.shape[-2] == values.shape[-2]
 
     d_k: int = keys.shape[-1]
-    product: Float[Tensor, "... seq_len seq_len"] = einsum(
+    product: Float[Tensor, "... query_len key_len"] = einsum(
         queries,
         keys,
         "... query_len d_k, ... key_len d_k -> ... query_len key_len"
     )
-    scaled_product: Float[Tensor, "... seq_len seq_len"] = product / math.sqrt(d_k)
-    masked_product: Float[Tensor, "... seq_len seq_len"] = scaled_product
+    scaled_product: Float[Tensor, "... query_len key_len"] = product / math.sqrt(d_k)
+    masked_product: Float[Tensor, "... query_len key_len"] = scaled_product
     if mask is not None:
         masked_product = masked_product.where(mask, -torch.inf)
 
