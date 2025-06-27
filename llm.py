@@ -208,12 +208,13 @@ class CausalMultiHeadAttention(torch.nn.Module):
         def split_multi_head(full: Float[Tensor, "... seq_len d_out"]) -> Float[Tensor, "... n_head seq_len d_k"]:
             return rearrange(full, "... seq_len (n_head d_k) -> ... n_head seq_len d_k", n_head=self.n_heads, d_k=self.d_k)
 
-        def weight_multiply(weights: Float[Tensor, "d_out d_in"]) -> Float[Tensor, "... seq_len d_out"]:
-            return einsum(
+        def weight_multiply(weights: Float[Tensor, "d_out d_in"]) -> Float[Tensor, "... n_head seq_len d_k"]:
+            full_weights: Float[Tensor, "... seq_len d_out"] = einsum(
                 x,
                 weights,
                 "... seq_len d_in, d_out d_in -> ... seq_len d_out"
             )
+            return split_multi_head(full_weights)
 
         queries = weight_multiply(self.weights_q)
         keys = weight_multiply(self.weights_k)
@@ -221,17 +222,8 @@ class CausalMultiHeadAttention(torch.nn.Module):
 
         # XXX combine above into single multiply?
 
-        multi_head_queries = split_multi_head(queries)
-        multi_head_keys = split_multi_head(keys)
-        multi_head_values = split_multi_head(values)
-
         attention_mask: Bool[Tensor, "query_len key_len"] = self.get_buffer("mask_buffer")[:queries.shape[-2],:keys.shape[-2]]
-
-        multi_head_context_vectors: Float[Tensor, "... n_head query_len d_k"] = attention(
-            multi_head_queries,
-            multi_head_keys,
-            multi_head_values,
-            mask=attention_mask)
+        multi_head_context_vectors: Float[Tensor, "... n_head query_len d_k"] = attention(queries, keys, values, mask=attention_mask)
 
         merged_context_vectors: Float[Tensor, "... query_len d_out"] = rearrange(
             multi_head_context_vectors,
