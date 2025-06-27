@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Dict, Optional
 
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, Bool
@@ -248,3 +248,50 @@ class CausalMultiHeadAttention(torch.nn.Module):
         )
 
         return result
+
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, context_length: int, rope_theta: Optional[float] = None, device: Optional[torch.device] = None):
+        super().__init__()
+        self.d_model: int = d_model
+        self.n_heads: int = n_heads
+        self.d_ff: int = d_ff
+        self.context_length: int = context_length
+        self.rope_theta: Optional[float] = rope_theta
+
+        self.attention_norm = RMSNorm(d_model=self.d_model, device=device)
+        self.attention = CausalMultiHeadAttention(
+                d_in=self.d_model,
+                d_out=self.d_model,
+                n_heads=self.n_heads,
+                context_length=self.context_length,
+                rope_theta=self.rope_theta,
+            )
+
+        self.feed_forward_norm = RMSNorm(d_model=self.d_model, device=device)
+        self.feed_forward = SwiGLU(d_model=self.d_model, d_ff=self.d_ff, device=device)
+
+    def forward(self, x: Float[Tensor, "... seq_len d_in"]) -> Float[Tensor, "... seq_len d_out"]:
+        context_vectors = self.attention(self.attention_norm(x))
+        context_vectors = context_vectors + x
+        result = self.feed_forward(self.feed_forward_norm(context_vectors)) + context_vectors
+        return result
+
+    def load_weights(self, weights: Dict[str, Tensor]) -> None:
+        self.attention.load_state_dict({
+            module_key : weights[dict_key] for module_key, dict_key in [
+                ("weights_q", "attn.q_proj.weight"),
+                ("weights_k", "attn.k_proj.weight"),
+                ("weights_v", "attn.v_proj.weight"),
+                ("weights_o", "attn.output_proj.weight"),
+            ]
+        })
+        self.attention_norm.load_state_dict({
+            "weights": weights["ln1.weight"],
+        })
+        self.feed_forward.load_state_dict({
+            x : weights[f"ffn.{x}.weight"] for x in ("w1", "w2", "w3")
+        })
+        self.feed_forward_norm.load_state_dict({
+            "weights": weights["ln2.weight"],
+        })
