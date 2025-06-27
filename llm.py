@@ -1,10 +1,40 @@
+from dataclasses import dataclass
 import math
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional, Self, TypeVar
 
 from einops import einsum, rearrange
 from jaxtyping import Float, Int, Bool
 import torch
 from torch import Tensor
+
+@dataclass
+class LMHyperparams:
+    vocab_size: int
+    context_length: int
+    d_model: int
+    d_ff: int
+    n_layers: int
+    n_heads: int
+    rope_theta: Optional[float]
+
+
+T = TypeVar("T")
+def dotted_to_nested_dict(d: Dict[str, T]) -> Dict:
+    def add(d: Dict[str, Any], key: List[str], value: Any) -> None:
+        if len(key) == 1:
+            assert key[0] not in d
+            d[key[0]] = value
+        else:
+            if key[0] in d:
+                assert isinstance(d[key[0]], dict)
+            else:
+                d[key[0]] = {}
+            add(d[key[0]], key[1:], value)
+    result = {}
+    for k, v in d.items():
+        add(result, k.split("."), v)
+    return result
+
 
 class Linear(torch.nn.Module):
     def __init__(self, dim_in: int, dim_out: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
@@ -251,7 +281,7 @@ class CausalMultiHeadAttention(torch.nn.Module):
 
 
 class TransformerBlock(torch.nn.Module):
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, context_length: int, rope_theta: Optional[float] = None, device: Optional[torch.device] = None):
+    def __init__(self, context_length: int, d_model: int, d_ff: int, n_heads: int, rope_theta: Optional[float] = None, device: Optional[torch.device] = None):
         super().__init__()
         self.d_model: int = d_model
         self.n_heads: int = n_heads
@@ -271,27 +301,77 @@ class TransformerBlock(torch.nn.Module):
         self.feed_forward_norm = RMSNorm(d_model=self.d_model, device=device)
         self.feed_forward = SwiGLU(d_model=self.d_model, d_ff=self.d_ff, device=device)
 
+    @classmethod
+    def from_params(cls, params: LMHyperparams) -> Self:
+        return TransformerBlock(**{
+            x : getattr(params, x) for x in[
+                "context_length",
+                "d_model",
+                "d_ff",
+                "n_heads",
+                "rope_theta",
+            ]
+        }) # type: ignore
+
     def forward(self, x: Float[Tensor, "... seq_len d_in"]) -> Float[Tensor, "... seq_len d_out"]:
         context_vectors = self.attention(self.attention_norm(x))
         context_vectors = context_vectors + x
         result = self.feed_forward(self.feed_forward_norm(context_vectors)) + context_vectors
         return result
 
-    def load_weights(self, weights: Dict[str, Tensor]) -> None:
+    def load_weights(self, weights: Dict) -> None:
         self.attention.load_state_dict({
-            module_key : weights[dict_key] for module_key, dict_key in [
-                ("weights_q", "attn.q_proj.weight"),
-                ("weights_k", "attn.k_proj.weight"),
-                ("weights_v", "attn.v_proj.weight"),
-                ("weights_o", "attn.output_proj.weight"),
+            module_key : weights["attn"][dict_key]["weight"] for module_key, dict_key in [
+                ("weights_q", "q_proj"),
+                ("weights_k", "k_proj"),
+                ("weights_v", "v_proj"),
+                ("weights_o", "output_proj"),
             ]
         })
         self.attention_norm.load_state_dict({
-            "weights": weights["ln1.weight"],
+            "weights": weights["ln1"]["weight"],
         })
         self.feed_forward.load_state_dict({
-            x : weights[f"ffn.{x}.weight"] for x in ("w1", "w2", "w3")
+            x : weights["ffn"][x]["weight"] for x in ("w1", "w2", "w3")
         })
         self.feed_forward_norm.load_state_dict({
-            "weights": weights["ln2.weight"],
+            "weights": weights["ln2"]["weight"],
+        })
+
+
+class TransformerLM(torch.nn.Module):
+    def __init__(self, params: LMHyperparams):
+        super().__init__()
+        self.params = params
+
+        self.embedding = Embedding(vocab_size=self.params.vocab_size, embedding_dim=self.params.d_model)
+        self.transformers = [TransformerBlock.from_params(params) for _ in range(params.n_layers)]
+        self.transformers_module = torch.nn.Sequential(*self.transformers)
+        self.output_norm = RMSNorm(d_model=self.params.d_model)
+        self.output_layer = Linear(dim_in=self.params.d_model, dim_out=self.params.vocab_size)
+
+    def forward(self, x: Int[Tensor, "... seq_len"]) -> Int[Tensor, "... seq_len vocab_size"]:
+        embeddings_in: Float[Tensor, "... seq_len d_model"] = self.embedding(x)
+        embeddings_out: Float[Tensor, "... seq_len d_model"] = self.transformers_module(embeddings_in)
+        output_values: Float[Tensor, "... seq_len vocab_size"] = self.output_layer(self.output_norm(embeddings_out))
+
+        # !!! diagram shows softmax before output, but expected test values are the raw (pre-softmax) values
+        # output_logits: Float[Tensor, "... seq_len vocab_size"] = softmax(output_values, dim=-1)
+        # return output_logits
+
+        return output_values
+
+    def load_weights(self, weights: Dict[str, Tensor]) -> None:
+        nested_weights = dotted_to_nested_dict(weights)
+
+        self.embedding.load_state_dict({
+            "embeddings": nested_weights["token_embeddings"]["weight"],
+        })
+        for i in range(self.params.n_layers):
+            self.transformers[i].load_weights(nested_weights["layers"][str(i)])
+        self.output_norm.load_state_dict({
+            "weights": nested_weights["ln_final"]["weight"],
+        })
+        self.output_layer.load_state_dict({
+            "weights": nested_weights["lm_head"]["weight"],
         })

@@ -316,7 +316,7 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    from llm import TransformerBlock
+    from llm import TransformerBlock, dotted_to_nested_dict
 
     transformer = TransformerBlock(
         d_model=d_model,
@@ -325,7 +325,7 @@ def run_transformer_block(
         context_length=max_seq_len,
         rope_theta=theta,
     )
-    transformer.load_weights(weights)
+    transformer.load_weights(dotted_to_nested_dict(weights))
     return transformer(in_features)
 
 
@@ -408,7 +408,20 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from llm import TransformerLM, LMHyperparams
+
+    params = LMHyperparams(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        d_ff=d_ff,
+        n_layers=num_layers,
+        n_heads=num_heads,
+        rope_theta=rope_theta
+    )
+    lm = TransformerLM(params)
+    lm.load_weights(weights)
+    return lm(in_indices)
 
 
 def run_rmsnorm(
