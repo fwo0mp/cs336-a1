@@ -161,7 +161,7 @@ def run_multihead_self_attention(
     """
     from llm import CausalMultiHeadAttention
 
-    module = CausalMultiHeadAttention(d_in=d_model, d_out=d_model, n_heads=num_heads)
+    module = CausalMultiHeadAttention(d_in=d_model, d_out=d_model, n_heads=num_heads, context_length=in_features.shape[-2])
     module.load_state_dict({
         "weights_q": q_proj_weight,
         "weights_k": k_proj_weight,
@@ -209,8 +209,17 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    from llm import CausalMultiHeadAttention
 
+    attention_module = CausalMultiHeadAttention(
+        d_in=d_model, d_out=d_model, n_heads=num_heads, context_length=max_seq_len, rope_theta=theta)
+    attention_module.load_state_dict({
+        "weights_q": q_proj_weight,
+        "weights_k": k_proj_weight,
+        "weights_v": v_proj_weight,
+        "weights_o": o_proj_weight,
+    })
+    return attention_module(in_features, token_positions=token_positions)
 
 def run_rope(
     d_k: int,

@@ -185,13 +185,14 @@ def attention(
     
 
 class CausalMultiHeadAttention(torch.nn.Module):
-    def __init__(self, d_in: int, d_out: int, n_heads: int):
+    def __init__(self, d_in: int, d_out: int, n_heads: int, context_length: int, rope_theta: Optional[float] = None):
         super().__init__()
-        self.d_in = d_in
-        self.d_out = d_out
-        self.n_heads = n_heads
+        self.d_in: int = d_in
+        self.d_out: int = d_out
+        self.n_heads: int = n_heads
         assert self.d_out % self.n_heads == 0
-        self.d_k = self.d_out // self.n_heads
+        self.d_k: int = self.d_out // self.n_heads
+        self.context_length: int = context_length
 
         self.weights_q = torch.nn.Parameter(torch.zeros(self.d_out, self.d_in))
         self.weights_k = torch.nn.Parameter(torch.zeros(self.d_out, self.d_in))
@@ -203,8 +204,13 @@ class CausalMultiHeadAttention(torch.nn.Module):
         mask_buffer = torch.tril(torch.ones(self.d_k, self.d_k)).to(torch.bool)
         self.register_buffer("mask_buffer", mask_buffer, persistent=False)
 
+        self.rope: Optional[RoPE] = RoPE(theta=rope_theta, d_k=self.d_k, context_length=self.context_length) if rope_theta is not None else None
 
-    def forward(self, x: Float[Tensor, "... seq_len d_in"]) -> Float[Tensor, "... seq_len d_out"]:
+
+    def forward(self,
+                x: Float[Tensor, "... seq_len d_in"],
+                token_positions: Optional[Int[Tensor, "... seq_len"]] = None
+                ) -> Float[Tensor, "... seq_len d_out"]:
         def multi_head_multiply(weights: Float[Tensor, "d_out d_in"]) -> Float[Tensor, "... n_head seq_len d_k"]:
             full_weights: Float[Tensor, "... seq_len d_out"] = einsum(
                 x,
@@ -218,6 +224,12 @@ class CausalMultiHeadAttention(torch.nn.Module):
         values = multi_head_multiply(self.weights_v)
 
         # XXX combine above into single multiply?
+
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(queries.shape[-2])
+            queries = self.rope(queries, token_positions)
+            keys = self.rope(keys, token_positions)
 
         attention_mask: Bool[Tensor, "query_len key_len"] = self.get_buffer("mask_buffer")[:queries.shape[-2],:keys.shape[-2]]
         multi_head_context_vectors: Float[Tensor, "... n_head query_len d_k"] = attention(queries, keys, values, mask=attention_mask)
