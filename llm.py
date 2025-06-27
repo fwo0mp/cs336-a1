@@ -353,13 +353,12 @@ class TransformerLM(torch.nn.Module):
     def forward(self, x: Int[Tensor, "... seq_len"]) -> Int[Tensor, "... seq_len vocab_size"]:
         embeddings_in: Float[Tensor, "... seq_len d_model"] = self.embedding(x)
         embeddings_out: Float[Tensor, "... seq_len d_model"] = self.transformers_module(embeddings_in)
-        output_values: Float[Tensor, "... seq_len vocab_size"] = self.output_layer(self.output_norm(embeddings_out))
+        output_logits: Float[Tensor, "... seq_len vocab_size"] = self.output_layer(self.output_norm(embeddings_out))
 
         # !!! diagram shows softmax before output, but expected test values are the raw (pre-softmax) values
-        # output_logits: Float[Tensor, "... seq_len vocab_size"] = softmax(output_values, dim=-1)
-        # return output_logits
+        # return softmax(output_logits, dim=-1)
 
-        return output_values
+        return output_logits
 
     def load_weights(self, weights: Dict[str, Tensor]) -> None:
         nested_weights = dotted_to_nested_dict(weights)
