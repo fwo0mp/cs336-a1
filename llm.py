@@ -88,3 +88,68 @@ class SwiGLU(torch.nn.Module):
             p3 = x @ self.w3.T
             inner_product = p1 * p3
             return inner_product @ self.w2.T
+
+
+class RoPE(torch.nn.Module):
+    def __init__(self, theta: float, d_k: int, context_length: int, device: Optional[torch.device] = None):
+        super().__init__()
+        self.theta = theta
+        self.d_k = d_k
+        self.context_length = context_length
+        self.device = device
+
+        i: Int[torch.Tensor, "context_length"] = torch.arange(self.context_length)
+        
+        # !!! according to doc these should have all been + 1 to be one-indexed instead of zero-indexed?
+        # but in order to match the test cases we have to remove the +1 at the end
+        k: Int[torch.Tensor, "d_k"] = (torch.arange(self.d_k) // 2)
+
+        thetas: Float[torch.Tensor, "context_length d_k"] = i.unsqueeze(1) / torch.pow(self.theta, (2 * k) / self.d_k)
+
+        # pre-cached 2-d arrays with all necessary cos/sin values precomputed
+        cos: Float[torch.Tensor, "context_length d_k"] = torch.cos(thetas)
+        sin: Float[torch.Tensor, "context_length d_k"] = torch.sin(thetas)
+        even_signs: Int[torch.Tensor, "d_k"] = torch.where(torch.arange(self.d_k) % 2 == 0, -1, 1)
+
+        # apply sign swaps to sin buffer before saving because it will be the same every time
+        sin = sin * even_signs
+
+        # indices to use for slicing when swapping each pair of values for sin multiplication
+        pair_increments: Int[torch.Tensor, "d_k"] = torch.where(torch.arange(self.d_k) % 2 == 0, 1, -1)
+        pair_swaps: Int[torch.Tensor, "d_k"] = torch.arange(self.d_k) + pair_increments
+
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.register_buffer("pair_swaps", pair_swaps, persistent=False)
+
+    def forward(self, x: Float[torch.Tensor, "... seq_len d_k"], token_positions: Int[torch.Tensor, "... seq_len"]) -> Float[torch.Tensor, "... seq_len d_k"]:
+        cos_slice: Float[torch.Tensor, "... seq_len d_k"] = self.get_buffer("cos")[token_positions,:]
+        sin_slice: Float[torch.Tensor, "... seq_len d_k"] = self.get_buffer("sin")[token_positions,:]
+
+        # swap each pair of indices before multiplying with sins
+        swapped_pairs: Float[torch.Tensor, "... seq_len d_k"] = x[...,self.get_buffer("pair_swaps")]
+
+        """
+        for any fixed token position i, we will get results like the following:
+            index 0: x_0 * cos(theta_ik) + x_1 * sin(theta_ik)
+            index 1: x_1 * cos(theta_ik) - x_0 * sin(theta_ik)
+            index 2: x_2 * cos(theta_ik) + x_3 * sin(theta_ik)
+            index 3: x_3 * cos(theta_ik) - x_2 * sin(theta_ik)
+            ...
+
+            in other words, each index should have its own value times the relevant cos, and its "paired" index
+            multiplied by sin, but with alternating signs for the sin term.
+
+            we apply the sign swaps when constructing the main sin buffer, and use the swapped_pairs call to
+            align each paired element for this addition
+        """
+        result: Float[torch.Tensor, "... seq_len d_k"] = x * cos_slice + swapped_pairs * sin_slice
+        return result
+
+
+def softmax(x: Float[torch.Tensor, "..."], dim: int) -> Float[torch.Tensor, "..."]:
+    max_values = x.max(dim=dim, keepdim=True).values
+    adjusted: Float[torch.Tensor, "..."] = x - max_values
+    exps: Float[torch.Tensor, "..."] = torch.exp(adjusted)
+    denoms = exps.sum(dim=dim, keepdim=True)
+    return exps / denoms
