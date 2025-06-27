@@ -211,19 +211,22 @@ class CausalMultiHeadAttention(torch.nn.Module):
                 x: Float[Tensor, "... seq_len d_in"],
                 token_positions: Optional[Int[Tensor, "... seq_len"]] = None
                 ) -> Float[Tensor, "... seq_len d_out"]:
-        def multi_head_multiply(weights: Float[Tensor, "d_out d_in"]) -> Float[Tensor, "... n_head seq_len d_k"]:
-            full_weights: Float[Tensor, "... seq_len d_out"] = einsum(
-                x,
-                weights,
-                "... seq_len d_in, d_out d_in -> ... seq_len d_out"
-            )
-            return rearrange(full_weights, "... seq_len (n_head d_k) -> ... n_head seq_len d_k", n_head=self.n_heads, d_k=self.d_k)
+        # squeeze all weights (q, k, v) into a single concatenated matrix so that we can evaluate in a single matmul...
+        all_weights: Float[Tensor, "d_out_all d_in"] = torch.concat([self.weights_q, self.weights_k, self.weights_v], dim=-2)
+        full_products: Float[Tensor, "... seq_len d_out_all"] = einsum(
+            x,
+            all_weights,
+            "... seq_len d_in, d_out_all d_in -> ... seq_len d_out_all"
+        )
+        # ... and then split them back into their respective components
+        full_queries, full_keys, full_values = torch.split(full_products, self.d_out, dim=-1)
 
-        queries = multi_head_multiply(self.weights_q)
-        keys = multi_head_multiply(self.weights_k)
-        values = multi_head_multiply(self.weights_v)
-
-        # XXX combine above into single multiply?
+        # then split each component into individual heads
+        def multi_head_split(full: Float[Tensor, "... seq_len d_out"]) -> Float[Tensor, "... n_head seq_len d_k"]:
+            return rearrange(full, "... seq_len (n_head d_k) -> ... n_head seq_len d_k", n_head=self.n_heads, d_k=self.d_k)
+        queries = multi_head_split(full_queries)
+        keys = multi_head_split(full_keys)
+        values = multi_head_split(full_values)
 
         if self.rope is not None:
             if token_positions is None:
