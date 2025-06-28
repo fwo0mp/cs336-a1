@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, Optional, Tuple
 import torch
 
 from einops import einsum, rearrange
@@ -67,3 +67,21 @@ def get_cosine_lr_schedule(t: int, lr_range: Tuple[float, float], n_warmup: int,
         return lr_min + scale_factor * (lr_max - lr_min)
     else:
         return lr_min
+
+
+def clip_gradients(params: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
+    eps = 1e-6
+    total_squared_gradient: float = 0.
+
+    for param in params:
+        if param.grad is not None:
+            total_squared_gradient += param.grad.pow(2).sum().item()
+
+    total_l2_norm: float = math.sqrt(total_squared_gradient)
+    if total_l2_norm <= max_l2_norm:
+        return
+
+    scaling_factor: float = max_l2_norm / (total_l2_norm + eps)
+    for param in params:
+        if param.grad is not None:
+            param.grad *= scaling_factor
