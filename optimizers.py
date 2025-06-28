@@ -53,3 +53,17 @@ class AdamW(torch.optim.Optimizer):
                 param_state["t"] = t + 1
 
         return loss
+
+
+def get_cosine_lr_schedule(t: int, lr_range: Tuple[float, float], n_warmup: int, n_anneal: int) -> float:
+    lr_min, lr_max = lr_range
+    if t < n_warmup:
+        return (t / n_warmup) * lr_max
+    elif t <= n_anneal:
+        cos_steps: int = t - n_warmup
+        total_cos_steps: int = n_anneal - n_warmup
+        cos_progress: float = cos_steps / total_cos_steps
+        scale_factor: float = (1 + math.cos(cos_progress * math.pi)) / 2
+        return lr_min + scale_factor * (lr_max - lr_min)
+    else:
+        return lr_min
