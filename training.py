@@ -1,3 +1,7 @@
+import random
+from typing import List, Tuple
+
+import numpy as np
 import torch
 
 from einops import rearrange
@@ -37,3 +41,24 @@ def cross_entropy(logits: Float[Tensor, "... batch_size vocab_size"], targets: I
     element_cross_entropy = rearrange(element_cross_entropy, "... batch_size 1 -> ... batch_size")
     result: Float[Tensor, "..."] = element_cross_entropy.mean(dim=-1)
     return result
+
+
+def create_training_batch(tokens: np.typing.NDArray, batch_size: int, context_length: int, device: str) -> Tuple[Tensor, Tensor]:
+    """
+        returns: (tensor of input tokens w/ shape (batch_size, context_length), tensor of target next tokens w/ same shape)
+
+        given signature of function, which is stateless wrt previous batches, we should be able to just sample uniformly
+        randomly from the entire dataset.
+    """
+    n_token: int = tokens.shape[-1]
+
+    input_result = torch.zeros(batch_size, context_length, device=device, dtype=torch.int)
+    output_result = torch.zeros(batch_size, context_length, device=device, dtype=torch.int)
+
+    batch_starts = (random.randint(0, n_token - context_length - 1) for _ in range(batch_size))
+    for i, batch_start in enumerate(batch_starts):
+        input_result[i, : ] = torch.Tensor(tokens[batch_start : batch_start+context_length])
+        output_result[i, : ] = torch.Tensor(tokens[batch_start + 1 : batch_start + 1 + context_length])
+
+    return input_result, output_result
+
